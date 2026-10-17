@@ -1,10 +1,11 @@
 
-import streamlit as st
+import threading
+
+import av
 import cv2
 import mediapipe as mp
 import numpy as np
-import threading
-
+import streamlit as st
 from streamlit_webrtc import (
     webrtc_streamer,
     WebRtcMode,
@@ -30,11 +31,9 @@ st.markdown("""
     background: linear-gradient(135deg, #080b18, #11152b, #10102a);
     color: #f1f5ff;
 }
-
 h1, h2, h3 {
     font-family: 'Orbitron', sans-serif !important;
 }
-
 .hero {
     text-align: center;
     padding: 22px 10px;
@@ -44,35 +43,29 @@ h1, h2, h3 {
     box-shadow: 0 0 28px #00eaff12;
     margin-bottom: 22px;
 }
-
 .hero h1 {
     font-size: clamp(28px, 5vw, 48px);
     background: linear-gradient(90deg, #00eaff, #bd82ff, #ff61bd);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
 }
-
 .hero p {
     color: #b4c4e4;
     font-family: 'Poppins', sans-serif;
 }
-
 div[data-testid="stMetric"] {
     background: #151b32;
     padding: 16px;
     border: 1px solid #3c4c75;
     border-radius: 12px;
 }
-
 div[data-testid="stMetricLabel"] {
     color: #8beeff;
 }
-
 .stButton button {
     border-radius: 10px;
     font-weight: 600;
 }
-
 .tip {
     background: #121a30;
     border-left: 4px solid #00eaff;
@@ -89,7 +82,6 @@ div[data-testid="stMetricLabel"] {
     <p>HAND TRACKING • COMPUTER VISION • REAL-TIME CREATIVITY</p>
 </div>
 """, unsafe_allow_html=True)
-
 
 # --------------------------------------------------
 # DRAWING SETTINGS
@@ -116,10 +108,16 @@ def create_canvas():
 
     # Decorative digital grid
     for x in range(0, WIDTH, 40):
-        cv2.line(canvas, (x, 0), (x, HEIGHT), (27, 34, 57), 1)
+        cv2.line(
+            canvas, (x, 0), (x, HEIGHT),
+            (27, 34, 57), 1
+        )
 
     for y in range(0, HEIGHT, 40):
-        cv2.line(canvas, (0, y), (WIDTH, y), (27, 34, 57), 1)
+        cv2.line(
+            canvas, (0, y), (WIDTH, y),
+            (27, 34, 57), 1
+        )
 
     cv2.putText(
         canvas,
@@ -136,7 +134,7 @@ def create_canvas():
 
 
 # --------------------------------------------------
-# SHARED STATE
+# SHARED DRAWING STATE
 # --------------------------------------------------
 
 class DrawingState:
@@ -147,7 +145,6 @@ class DrawingState:
         self.brush_size = 7
         self.eraser = False
         self.hits = 0
-        self.draw_active = False
 
     def clear(self):
         with self.lock:
@@ -167,6 +164,10 @@ class AirDrawProcessor(VideoProcessorBase):
         self.state = drawing_state
         self.previous_point = None
 
+        # Process every second frame to reduce CPU use
+        self.frame_count = 0
+        self.last_results = None
+
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
@@ -177,31 +178,41 @@ class AirDrawProcessor(VideoProcessorBase):
         )
 
     def recv(self, frame):
-        # Get webcam frame
         image = frame.to_ndarray(format="bgr24")
 
-        # Mirror image like a selfie camera
+        # Mirror the webcam like a selfie camera
         image = cv2.flip(image, 1)
-        image = cv2.resize(image, (WIDTH, HEIGHT))
+        image = cv2.resize(
+            image,
+            (WIDTH, HEIGHT),
+            interpolation=cv2.INTER_AREA,
+        )
 
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
+
+        # Run hand detection on alternate frames
+        self.frame_count += 1
+
+        if self.frame_count % 2 == 0 or self.last_results is None:
+            self.last_results = self.hands.process(rgb)
+
+        results = self.last_results
 
         drawing_now = False
         finger_point = None
         message = "SHOW YOUR HAND"
+        hand = None
 
-        if results.multi_hand_landmarks:
+        if results and results.multi_hand_landmarks:
             hand = results.multi_hand_landmarks[0]
             landmarks = hand.landmark
 
-            # Index and middle finger landmarks
             index_tip = landmarks[8]
             index_pip = landmarks[6]
             middle_tip = landmarks[12]
             middle_pip = landmarks[10]
 
-            # Draw when index is up and middle finger is down
+            # Finger gesture detection
             index_up = index_tip.y < index_pip.y
             middle_up = middle_tip.y < middle_pip.y
 
@@ -221,7 +232,7 @@ class AirDrawProcessor(VideoProcessorBase):
             else:
                 message = "RAISE INDEX FINGER"
 
-            # Draw on shared canvas
+            # Draw on the digital canvas
             with self.state.lock:
                 if drawing_now:
                     color = (
@@ -262,7 +273,7 @@ class AirDrawProcessor(VideoProcessorBase):
             else:
                 self.previous_point = None
 
-            # Draw hand landmarks on webcam preview
+            # Hand landmarks on the camera preview
             mp.solutions.drawing_utils.draw_landmarks(
                 image,
                 hand,
@@ -272,7 +283,7 @@ class AirDrawProcessor(VideoProcessorBase):
             cv2.circle(
                 image,
                 finger_point,
-                10,
+                8,
                 (255, 255, 255),
                 2,
             )
@@ -280,8 +291,10 @@ class AirDrawProcessor(VideoProcessorBase):
         else:
             self.previous_point = None
 
-        # Camera preview labels
-        cv2.rectangle(image, (0, 0), (WIDTH, 48), (15, 20, 40), -1)
+        # Camera preview header
+        cv2.rectangle(
+            image, (0, 0), (WIDTH, 48), (15, 20, 40), -1
+        )
 
         cv2.putText(
             image,
@@ -311,23 +324,17 @@ class AirDrawProcessor(VideoProcessorBase):
             cv2.LINE_AA,
         )
 
-        # Copy canvas safely for live display
+        # Copy the canvas safely
         with self.state.lock:
-            canvas = self.state.canvas.copy()
+            canvas_copy = self.state.canvas.copy()
 
-        # Display webcam and canvas side by side
-        combined = np.hstack((image, canvas))
+        # Camera on left, drawing canvas on right
+        combined = np.hstack((image, canvas_copy))
 
-        return av_frame(combined)
-
-
-# --------------------------------------------------
-# VIDEO FRAME CONVERSION
-# --------------------------------------------------
-
-def av_frame(image):
-    import av
-    return av.VideoFrame.from_ndarray(image, format="bgr24")
+        return av.VideoFrame.from_ndarray(
+            combined,
+            format="bgr24",
+        )
 
 
 # --------------------------------------------------
@@ -397,23 +404,34 @@ with right:
         state.clear()
 
 st.markdown(
-    '<div class="tip">💡 Tip: Keep your hand visible, '
-    'raise only your index finger to draw, and raise two fingers '
-    'to move without drawing.</div>',
+    '<div class="tip">💡 Keep your hand visible, raise only '
+    'your index finger to draw, and raise two fingers to move '
+    'without drawing.</div>',
     unsafe_allow_html=True,
 )
 
-# WebRTC must run through the browser's camera.
-webrtc_ctx = webrtc_streamer(
+# --------------------------------------------------
+# WEBCAM STREAM
+# --------------------------------------------------
+
+webrtc_streamer(
     key="air-draw-camera",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=lambda: AirDrawProcessor(state),
     media_stream_constraints={
-        "video": True,
+        "video": {
+            "frameRate": {"ideal": 15, "max": 15},
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+        },
         "audio": False,
     },
     async_processing=True,
 )
+
+# --------------------------------------------------
+# AI EXPLANATION
+# --------------------------------------------------
 
 st.markdown("---")
 st.markdown("### 🧠 How the AI Vision System Works")
@@ -426,11 +444,15 @@ with c1:
 
 with c2:
     st.markdown("#### 02 · TRACK")
-    st.write("MediaPipe tracks your hand landmarks and index fingertip.")
+    st.write(
+        "MediaPipe tracks hand landmarks and the index fingertip."
+    )
 
 with c3:
     st.markdown("#### 03 · CREATE")
-    st.write("The program maps fingertip movement into digital brush strokes.")
+    st.write(
+        "The program converts fingertip movement into digital brush strokes."
+    )
 
 st.caption(
     "AIR DRAW AI | Computer Vision • Gesture Recognition • Creative Coding"
